@@ -3,17 +3,21 @@
 //! `docker run --gpus all`, Compose's `deploy.resources.reservations.devices`
 //! and `--device nvidia.com/gpu=0` all name a device the host's Container
 //! Device Interface spec describes (`nvidia-ctk cdi generate` writes one to
-//! `/etc/cdi/nvidia.yaml`). Kiri reads that spec at every start, so a driver
-//! update is picked up, and turns its `containerEdits` into what the guest
-//! already does: device nodes (with their cgroup rules), bind mounts, env and
-//! groups. The agent runs on the host's own kernel and filesystem there, so
-//! the host's paths can be bound as they are.
+//! `/etc/cdi/nvidia.yaml`; AMD and Intel have their own kinds, see
+//! [`VENDORS`]). Kiri reads that spec at every start of a container that asks
+//! for a GPU, so a driver update is picked up, and turns its `containerEdits`
+//! into what the guest already does: device nodes (with their cgroup rules),
+//! bind mounts, env and groups. The agent runs on the host's own kernel and
+//! filesystem there, so the host's paths can be bound as they are.
 //!
 //! Hooks are not run, but the one the NVIDIA spec needs for CUDA is done in
 //! place of it: `create-symlinks` makes `libcuda.so.1` from `libcuda.so.<v>`.
 //! The driver's libraries are bound under [`LIB_DIR`] (where the `nvidia/cuda`
 //! images already look) with those names, and `LD_LIBRARY_PATH` names it, so
 //! no `ld.so.cache` is needed.
+//!
+//! What differs between vendors is data in [`VENDORS`]; the code below does
+//! not name one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,8 +27,64 @@ use serde_json::{Map, Value};
 /// Where the host's CDI specs are looked for, as the CDI spec says.
 pub const SPEC_DIRS: [&str; 2] = ["/etc/cdi", "/var/run/cdi"];
 
-/// Where the driver's libraries are bound in the container.
+/// Where the libraries of a vendor with [`Vendor::shared_lib_dir`] are bound in the container.
 const LIB_DIR: &str = "/usr/local/nvidia/lib64";
+
+/// What a GPU vendor needs that another does not. A new vendor is one more row of [`VENDORS`].
+struct Vendor {
+    /// `--gpus driver=<name>`: the names that mean this vendor. NVIDIA is also the default driver (`""`).
+    drivers: &'static [&'static str],
+    /// The CDI kind of its devices.
+    kind: &'static str,
+    /// What to tell the user when the host has no spec for `kind`.
+    hint: &'static str,
+    /// Its libraries are bound together under [`LIB_DIR`], with the links its
+    /// spec's hooks would make, and `LD_LIBRARY_PATH` names that directory.
+    /// Else they stay where the spec puts them.
+    shared_lib_dir: bool,
+    /// Env keys with this prefix are its toolkit's own notes, not for the container.
+    private_env: &'static str,
+}
+
+const VENDORS: [Vendor; 3] = [
+    Vendor {
+        drivers: &["", "nvidia"],
+        kind: "nvidia.com/gpu",
+        hint: "for NVIDIA, install nvidia-container-toolkit and run: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+        shared_lib_dir: true,
+        private_env: "NVIDIA_CTK_",
+    },
+    Vendor {
+        drivers: &["amd"],
+        kind: "amd.com/gpu",
+        hint: "for AMD, install the AMD container toolkit and run: sudo amd-ctk cdi generate --output=/etc/cdi/amd.json; or pass --device /dev/kfd --device /dev/dri",
+        shared_lib_dir: false,
+        private_env: "",
+    },
+    Vendor {
+        drivers: &["intel"],
+        kind: "intel.com/gpu",
+        hint: "for Intel, pass --device /dev/dri, or add a CDI spec for intel.com/gpu to /etc/cdi",
+        shared_lib_dir: false,
+        private_env: "",
+    },
+];
+
+/// What to tell the user about a kind no [`Vendor`] knows.
+const OTHER_HINT: &str = "add a CDI spec for it to /etc/cdi";
+
+fn vendor_of_driver(driver: &str) -> Option<&'static Vendor> {
+    VENDORS.iter().find(|v| v.drivers.contains(&driver))
+}
+
+fn vendor_of_kind(kind: &str) -> Option<&'static Vendor> {
+    VENDORS.iter().find(|v| v.kind == kind)
+}
+
+/// Docker's error for a device request Kiri cannot give.
+fn select_error(why: impl std::fmt::Display) -> String {
+    format!("could not select device driver \"\" with capabilities: [[gpu]]: {why}")
+}
 
 /// What the specs for a container's devices add to it.
 #[derive(Debug, Default, PartialEq)]
@@ -41,28 +101,18 @@ impl Edits {
     /// Adds what the spec sets to `env`, except the keys it already has;
     /// `LD_LIBRARY_PATH` gets [`LIB_DIR`] in front.
     pub fn apply_env(&self, env: &mut Vec<String>) {
-        for e in &self.env {
+        const LD: &str = "LD_LIBRARY_PATH=";
+        for e in self.env.iter().filter(|e| !e.starts_with(LD)) {
             let key = e.split('=').next().unwrap_or_default();
-            if key == "LD_LIBRARY_PATH" {
-                continue;
-            }
             if !env.iter().any(|x| x.split('=').next() == Some(key)) {
                 env.push(e.clone());
             }
         }
-        if let Some(path) = self
-            .env
-            .iter()
-            .find_map(|e| e.strip_prefix("LD_LIBRARY_PATH="))
-        {
-            match env.iter_mut().find(|x| x.starts_with("LD_LIBRARY_PATH=")) {
-                Some(x)
-                    if x.split_once('=')
-                        .is_some_and(|(_, v)| v.split(':').any(|d| d == path)) => {}
-                Some(x) => {
-                    *x = format!("LD_LIBRARY_PATH={path}:{}", &x["LD_LIBRARY_PATH=".len()..])
-                }
-                None => env.push(format!("LD_LIBRARY_PATH={path}")),
+        if let Some(path) = self.env.iter().find_map(|e| e.strip_prefix(LD)) {
+            match env.iter_mut().find(|x| x.starts_with(LD)) {
+                Some(x) if x[LD.len()..].split(':').any(|d| d == path) => {}
+                Some(x) => *x = format!("{LD}{path}:{}", &x[LD.len()..]),
+                None => env.push(format!("{LD}{path}")),
             }
         }
     }
@@ -73,12 +123,20 @@ pub fn is_qualified(name: &str) -> bool {
     match name.split_once('=') {
         Some((kind, device)) => {
             !device.is_empty()
-                && kind.split_once('/').is_some_and(|(vendor, class)| {
-                    vendor.contains('.') && !class.is_empty() && !vendor.is_empty()
-                })
+                && kind.split_once('/').is_some_and(|(vendor, class)| vendor.contains('.') && !class.is_empty() && !vendor.is_empty())
         }
         None => false,
     }
+}
+
+/// The elements of the array `v[key]`, if it is one.
+fn items<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    v[key].as_array().into_iter().flatten()
+}
+
+/// The strings of the array `v[key]`.
+fn strs<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a str> {
+    items(v, key).filter_map(Value::as_str)
 }
 
 /// Which devices of a kind a container asked for.
@@ -89,117 +147,57 @@ enum Pick {
     Name(String),
 }
 
+/// `kind=name` as (kind, which).
+fn split(qualified: &str) -> (String, Pick) {
+    let (kind, name) = qualified.split_once('=').unwrap_or((qualified, ""));
+    (kind.to_owned(), if name == "all" { Pick::All } else { Pick::Name(name.to_owned()) })
+}
+
+/// What one DeviceRequest asks for: with a vendor's driver, its devices by
+/// number, id or all of them; with the driver `cdi`, devices by CDI name.
+fn request(r: &Value) -> Result<Vec<(String, Pick)>, String> {
+    let driver = r["Driver"].as_str().unwrap_or("");
+    let caps: Vec<&str> = items(r, "Capabilities").flat_map(|c| c.as_array().into_iter().flatten()).filter_map(Value::as_str).collect();
+    let ids: Vec<&str> = strs(r, "DeviceIDs").collect();
+    if driver == "cdi" {
+        return ids
+            .into_iter()
+            .map(|id| if is_qualified(id) { Ok(split(id)) } else { Err(format!("could not select device driver \"cdi\" with capabilities: [{}]: {id:?} is not a CDI device name", caps.join(" "))) })
+            .collect();
+    }
+    let vendor = vendor_of_driver(driver).filter(|_| caps.contains(&"gpu") || caps.contains(&"nvidia")).ok_or_else(|| {
+        format!(
+            "could not select device driver {driver:?} with capabilities: [{}]: Kiri supports GPUs through CDI specs (driver \"nvidia\" or \"\", \"amd\" or \"intel\", with capability \"gpu\", or driver \"cdi\")",
+            caps.iter().map(|c| format!("[{c}]")).collect::<Vec<_>>().join(" ")
+        )
+    })?;
+    let count = r["Count"].as_i64().unwrap_or(0);
+    Ok(if !ids.is_empty() {
+        ids.into_iter().map(|id| if is_qualified(id) { split(id) } else { (vendor.kind.to_owned(), Pick::Name(id.to_owned())) }).collect()
+    } else if count < 0 {
+        vec![(vendor.kind.to_owned(), Pick::All)]
+    } else if count > 0 {
+        vec![(vendor.kind.to_owned(), Pick::First(count as usize))]
+    } else {
+        Vec::new()
+    })
+}
+
 /// The devices HostConfig asks for, as (CDI kind, which): `--gpus` and
 /// Compose's device reservations arrive as DeviceRequests, `--device` with a
 /// CDI name as a `Devices` entry whose PathOnHost is that name.
 fn requested(opts: &Value) -> Result<Vec<(String, Pick)>, String> {
     let mut out = Vec::new();
-    for r in opts["DeviceRequests"].as_array().into_iter().flatten() {
-        let driver = r["Driver"].as_str().unwrap_or("");
-        let caps: Vec<&str> = r["Capabilities"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|c| c.as_array().into_iter().flatten())
-            .filter_map(|c| c.as_str())
-            .collect();
-        let ids: Vec<&str> = r["DeviceIDs"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| c.as_str())
-            .collect();
-        match driver {
-            d if vendor_kind(d).is_some() && (caps.contains(&"gpu") || caps.contains(&"nvidia")) => {
-                let kind = vendor_kind(d).unwrap_or_default();
-                let count = r["Count"].as_i64().unwrap_or(0);
-                if !ids.is_empty() {
-                    for id in ids {
-                        out.push(if is_qualified(id) {
-                            split(id)
-                        } else {
-                            (kind.to_owned(), Pick::Name(id.to_owned()))
-                        });
-                    }
-                } else if count < 0 {
-                    out.push((kind.to_owned(), Pick::All));
-                } else if count > 0 {
-                    out.push((kind.to_owned(), Pick::First(count as usize)));
-                }
-            }
-            "cdi" => {
-                for id in ids {
-                    if !is_qualified(id) {
-                        return Err(format!(
-                            "could not select device driver \"cdi\" with capabilities: [{}]: {id:?} is not a CDI device name",
-                            caps.join(" ")
-                        ));
-                    }
-                    out.push(split(id));
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "could not select device driver {driver:?} with capabilities: [{}]: Kiri supports GPUs through CDI specs (driver \"nvidia\" or \"\", \"amd\" or \"intel\", with capability \"gpu\", or driver \"cdi\")",
-                    caps.iter()
-                        .map(|c| format!("[{c}]"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ));
-            }
-        }
+    for r in items(opts, "DeviceRequests") {
+        out.extend(request(r)?);
     }
-    for d in opts["Devices"].as_array().into_iter().flatten() {
-        if let Some(n) = d["PathOnHost"].as_str().filter(|n| is_qualified(n)) {
-            out.push(split(n));
-        }
-    }
+    out.extend(items(opts, "Devices").filter_map(|d| d["PathOnHost"].as_str()).filter(|n| is_qualified(n)).map(split));
     Ok(out)
-}
-
-fn split(qualified: &str) -> (String, Pick) {
-    let (kind, name) = qualified.split_once('=').unwrap_or((qualified, ""));
-    (
-        kind.to_owned(),
-        if name == "all" {
-            Pick::All
-        } else {
-            Pick::Name(name.to_owned())
-        },
-    )
-}
-
-/// The CDI kind `--gpus driver=<name>` means. NVIDIA is the default driver
-/// (what `--gpus all` sends); `amd` and `intel` name the other two vendors.
-fn vendor_kind(driver: &str) -> Option<&'static str> {
-    match driver {
-        "" | "nvidia" => Some("nvidia.com/gpu"),
-        "amd" => Some("amd.com/gpu"),
-        "intel" => Some("intel.com/gpu"),
-        _ => None,
-    }
-}
-
-/// What to do when the host has no spec for `kind`.
-fn missing_hint(kind: &str) -> &'static str {
-    match kind {
-        "nvidia.com/gpu" => "for NVIDIA, install nvidia-container-toolkit and run: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
-        "amd.com/gpu" => "for AMD, install the AMD container toolkit and run: sudo amd-ctk cdi generate --output=/etc/cdi/amd.json; or pass --device /dev/kfd --device /dev/dri",
-        "intel.com/gpu" => "for Intel, pass --device /dev/dri, or add a CDI spec for intel.com/gpu to /etc/cdi",
-        _ => "add a CDI spec for it to /etc/cdi",
-    }
 }
 
 /// Whether `opts` (a container's kept HostConfig) asks for CDI devices.
 pub fn wanted(opts: &Value) -> bool {
-    !opts["DeviceRequests"]
-        .as_array()
-        .is_none_or(|a| a.is_empty())
-        || opts["Devices"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|d| d["PathOnHost"].as_str().is_some_and(is_qualified))
+    items(opts, "DeviceRequests").next().is_some() || items(opts, "Devices").any(|d| d["PathOnHost"].as_str().is_some_and(is_qualified))
 }
 
 /// What the container's devices add to it, from the specs in [`SPEC_DIRS`].
@@ -215,198 +213,144 @@ pub fn edits(opts: &Value) -> Result<Edits, String> {
     edits_in(opts, &SPEC_DIRS.map(PathBuf::from))
 }
 
+fn device_name(d: &Value) -> String {
+    match &d["name"] {
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+/// A device named by its number: the ones `all` and a count choose among.
+fn is_indexed(d: &Value) -> bool {
+    device_name(d).bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The devices of `kind` that `pick` names, as (index of its spec, device).
+fn select<'a>(specs: &'a [Value], kind: &str, pick: &Pick, dirs: &[PathBuf]) -> Result<Vec<(usize, &'a Value)>, String> {
+    let of_kind: Vec<usize> = specs.iter().enumerate().filter(|(_, s)| s["kind"].as_str() == Some(kind)).map(|(i, _)| i).collect();
+    if of_kind.is_empty() {
+        let hint = vendor_of_kind(kind).map_or(OTHER_HINT, |v| v.hint);
+        let places = dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(" or ");
+        return Err(select_error(format!("no CDI spec for {kind} in {places} ({hint})")));
+    }
+    let devices = || of_kind.iter().flat_map(|&i| items(&specs[i], "devices").map(move |d| (i, d)));
+    match pick {
+        Pick::Name(n) => devices().find(|(_, d)| device_name(d) == *n).map(|d| vec![d]).ok_or_else(|| format!("unresolvable CDI devices {kind}={n}")),
+        // The spec's own "all" if it has one, else every device with an index for a name.
+        Pick::All => Ok(devices().find(|(_, d)| device_name(d) == "all").map(|d| vec![d]).unwrap_or_else(|| devices().filter(|(_, d)| is_indexed(d)).collect())),
+        Pick::First(n) => {
+            let all: Vec<_> = devices().filter(|(_, d)| is_indexed(d)).collect();
+            if all.len() < *n {
+                return Err(select_error(format!("requested {n} {kind} devices but only {} found", all.len())));
+            }
+            Ok(all.into_iter().take(*n).collect())
+        }
+    }
+}
+
 fn edits_in(opts: &Value, dirs: &[PathBuf]) -> Result<Edits, String> {
     let requests = requested(opts)?;
     let specs = load(dirs);
-    let mut picked: Vec<(usize, &Value)> = Vec::new(); // (spec, device)
+    let mut picked: Vec<(usize, &Value)> = Vec::new();
     for (kind, pick) in &requests {
-        let found: Vec<(usize, &Value)> = specs
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s["kind"].as_str() == Some(kind))
-            .collect();
-        if found.is_empty() {
-            return Err(format!(
-                "could not select device driver \"\" with capabilities: [[gpu]]: no CDI spec for {kind} in {} ({})",
-                dirs.iter()
-                    .map(|d| d.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" or "),
-                missing_hint(kind)
-            ));
-        }
-        let devices = |i: usize| specs[i]["devices"].as_array().into_iter().flatten();
-        let name_of = |d: &Value| match &d["name"] {
-            Value::String(s) => s.clone(),
-            v => v.to_string(),
-        };
-        let indexed = |d: &Value| name_of(d).bytes().all(|b| b.is_ascii_digit());
-        match pick {
-            Pick::Name(n) => {
-                let Some(d) = found
-                    .iter()
-                    .find_map(|(i, _)| devices(*i).find(|d| name_of(d) == *n).map(|d| (*i, d)))
-                else {
-                    return Err(format!("unresolvable CDI devices {kind}={n}"));
-                };
-                picked.push(d);
-            }
-            Pick::All => {
-                // The spec's own "all" if it has one, else every device with an index for a name.
-                match found
-                    .iter()
-                    .find_map(|(i, _)| devices(*i).find(|d| name_of(d) == "all").map(|d| (*i, d)))
-                {
-                    Some(d) => picked.push(d),
-                    None => found.iter().for_each(|(i, _)| {
-                        picked.extend(devices(*i).filter(|d| indexed(d)).map(|d| (*i, d)))
-                    }),
-                }
-            }
-            Pick::First(n) => {
-                let all: Vec<(usize, &Value)> = found
-                    .iter()
-                    .flat_map(|(i, _)| devices(*i).filter(|d| indexed(d)).map(|d| (*i, d)))
-                    .collect();
-                if all.len() < *n {
-                    return Err(format!(
-                        "could not select device driver \"\" with capabilities: [[gpu]]: requested {n} {kind} devices but only {} found",
-                        all.len()
-                    ));
-                }
-                picked.extend(all.into_iter().take(*n));
-            }
-        }
+        picked.extend(select(&specs, kind, pick, dirs)?);
     }
-    let mut spec_ids: Vec<usize> = picked.iter().map(|(i, _)| *i).collect();
-    spec_ids.dedup();
-    let mut all_edits: Vec<&Value> = Vec::new();
-    let mut seen = BTreeSet::new();
-    for i in spec_ids {
-        if seen.insert(i) {
-            all_edits.push(&specs[i]["containerEdits"]);
-        }
-    }
-    all_edits.extend(picked.iter().map(|(_, d)| &d["containerEdits"]));
-    // NVIDIA's libraries are bound together under one directory; another vendor's stay where its spec puts them.
-    let relocate = requests.iter().any(|(k, _)| k.starts_with("nvidia.com/"));
+    // A spec's own edits once, however many of its devices are picked, then each device's.
+    let spec_ids: BTreeSet<usize> = picked.iter().map(|(i, _)| *i).collect();
+    let all_edits: Vec<&Value> = spec_ids.iter().map(|&i| &specs[i]["containerEdits"]).chain(picked.iter().map(|(_, d)| &d["containerEdits"])).collect();
+    let relocate = requests.iter().any(|(k, _)| vendor_of_kind(k).is_some_and(|v| v.shared_lib_dir));
     apply(&all_edits, relocate)
 }
 
-fn apply(edits: &[&Value], relocate: bool) -> Result<Edits, String> {
-    let mut out = Edits::default();
-    let mut nodes: BTreeMap<String, String> = BTreeMap::new(); // container path → line
-    let mut mounts: Vec<(String, String, bool)> = Vec::new();
-    let mut links: Vec<(String, String)> = Vec::new();
-    let mut groups = BTreeSet::new();
-    let mut env: Vec<String> = Vec::new();
-    for e in edits {
-        for n in e["deviceNodes"].as_array().into_iter().flatten() {
-            let path = n["path"].as_str().unwrap_or("");
-            let host = n["hostPath"]
-                .as_str()
-                .filter(|h| !h.is_empty())
-                .unwrap_or(path);
-            let perms = n["permissions"]
-                .as_str()
-                .filter(|p| !p.is_empty())
-                .unwrap_or("rwm");
-            for p in [host, path] {
-                if !p.starts_with('/')
-                    || p.contains(['\t', '\n'])
-                    || p.split('/').any(|c| c == "..")
-                {
-                    return Err(format!("CDI spec: invalid device path {p:?}"));
-                }
-            }
-            if perms.len() > 3 || !perms.chars().all(|c| "rwm".contains(c)) {
-                return Err(format!("CDI spec: invalid device permissions {perms:?}"));
-            }
-            nodes
-                .entry(path.to_owned())
-                .or_insert_with(|| format!("device\t{host}\t{path}\t{perms}"));
-        }
-        for m in e["mounts"].as_array().into_iter().flatten() {
-            let (host, ctr) = (
-                m["hostPath"].as_str().unwrap_or(""),
-                m["containerPath"].as_str().unwrap_or(""),
-            );
-            for p in [host, ctr] {
-                if !p.starts_with('/')
-                    || p.contains(['\t', '\n'])
-                    || p.split('/').any(|c| c == "..")
-                {
-                    return Err(format!("CDI spec: invalid mount path {p:?}"));
-                }
-            }
-            let ro = m["options"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|o| o.as_str() == Some("ro"));
-            mounts.push((host.to_owned(), ctr.to_owned(), ro));
-        }
-        for h in e["hooks"].as_array().into_iter().flatten() {
-            let args: Vec<&str> = h["args"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|a| a.as_str())
-                .collect();
-            if args.get(1) == Some(&"create-symlinks") {
-                let mut it = args.iter();
-                while let Some(a) = it.next() {
-                    if *a == "--link"
-                        && let Some((target, link)) = it.next().and_then(|l| l.split_once("::"))
-                    {
-                        links.push((target.to_owned(), link.to_owned()));
-                    }
-                }
-            }
-        }
-        for g in e["additionalGids"].as_array().into_iter().flatten() {
-            if let Some(g) = g.as_u64() {
-                groups.insert(g);
-            }
-        }
-        for v in e["env"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str())
-        {
-            let key = v.split('=').next().unwrap_or_default();
-            // The toolkit's own hints about where it put the libraries.
-            if !key.starts_with("NVIDIA_CTK_")
-                && !env.iter().any(|x| x.split('=').next() == Some(key))
-            {
-                env.push(v.to_owned());
-            }
-        }
+/// A path the guest takes in a tab-separated line: absolute, one line, no `..`.
+fn check_path(p: &str, what: &str) -> Result<(), String> {
+    if !p.starts_with('/') || p.contains(['\t', '\n']) || p.split('/').any(|c| c == "..") {
+        return Err(format!("CDI spec: invalid {what} path {p:?}"));
     }
+    Ok(())
+}
 
-    // The links hooks would make, as more binds of the file they point at.
-    let mut bound: BTreeMap<String, (String, bool)> = BTreeMap::new();
-    for (host, ctr, ro) in mounts {
-        if Path::new(&host).exists() {
-            bound.entry(ctr).or_insert((host, ro));
+/// The guest's `device` line for a `deviceNodes` entry, and the path it makes in the container.
+fn device_line(n: &Value) -> Result<(String, String), String> {
+    let path = n["path"].as_str().unwrap_or("");
+    let host = n["hostPath"].as_str().filter(|h| !h.is_empty()).unwrap_or(path);
+    let perms = n["permissions"].as_str().filter(|p| !p.is_empty()).unwrap_or("rwm");
+    check_path(host, "device")?;
+    check_path(path, "device")?;
+    if perms.len() > 3 || !perms.chars().all(|c| "rwm".contains(c)) {
+        return Err(format!("CDI spec: invalid device permissions {perms:?}"));
+    }
+    Ok((path.to_owned(), format!("device\t{host}\t{path}\t{perms}")))
+}
+
+/// A `mounts` entry as (host path, container path, read-only).
+fn mount_of(m: &Value) -> Result<(String, String, bool), String> {
+    let (host, ctr) = (m["hostPath"].as_str().unwrap_or(""), m["containerPath"].as_str().unwrap_or(""));
+    check_path(host, "mount")?;
+    check_path(ctr, "mount")?;
+    Ok((host.to_owned(), ctr.to_owned(), strs(m, "options").any(|o| o == "ro")))
+}
+
+/// The links a `create-symlinks` hook makes, as (target, link): `--link target::link`.
+fn symlinks(hook: &Value) -> Vec<(String, String)> {
+    let args: Vec<&str> = strs(hook, "args").collect();
+    if args.get(1) != Some(&"create-symlinks") {
+        return Vec::new();
+    }
+    args.windows(2).filter(|w| w[0] == "--link").filter_map(|w| w[1].split_once("::")).map(|(t, l)| (t.to_owned(), l.to_owned())).collect()
+}
+
+/// An env key a vendor's toolkit keeps to itself.
+fn is_private_env(key: &str) -> bool {
+    VENDORS.iter().any(|v| !v.private_env.is_empty() && key.starts_with(v.private_env))
+}
+
+/// What the `containerEdits` say, checked and sorted by kind.
+#[derive(Default)]
+struct Collected {
+    /// Container path → the guest's `device` line.
+    nodes: BTreeMap<String, String>,
+    /// (host path, container path, read-only)
+    mounts: Vec<(String, String, bool)>,
+    /// (target, link) of the `create-symlinks` hooks.
+    links: Vec<(String, String)>,
+    groups: BTreeSet<u64>,
+    env: Vec<String>,
+}
+
+fn collect(edits: &[&Value]) -> Result<Collected, String> {
+    let mut c = Collected::default();
+    for e in edits {
+        for n in items(e, "deviceNodes") {
+            let (path, line) = device_line(n)?;
+            c.nodes.entry(path).or_insert(line);
+        }
+        for m in items(e, "mounts") {
+            c.mounts.push(mount_of(m)?);
+        }
+        for h in items(e, "hooks") {
+            c.links.extend(symlinks(h));
+        }
+        c.groups.extend(items(e, "additionalGids").filter_map(Value::as_u64));
+        for v in strs(e, "env") {
+            let key = v.split('=').next().unwrap_or_default();
+            if !is_private_env(key) && !c.env.iter().any(|x| x.split('=').next() == Some(key)) {
+                c.env.push(v.to_owned());
+            }
         }
     }
+    Ok(c)
+}
+
+/// The links hooks would make, as more binds of the file they point at: each
+/// `link` in `bound` with the host file of its `target`, until none is new.
+fn bind_links(bound: &mut BTreeMap<String, (String, bool)>, links: &[(String, String)]) {
     for _ in 0..=links.len() {
         let mut changed = false;
-        for (target, link) in &links {
-            let at = if target.starts_with('/') {
-                target.clone()
-            } else {
-                normalize(&format!(
-                    "{}/{target}",
-                    link.rsplit_once('/').map_or("", |d| d.0)
-                ))
-            };
-            if let Some(b) = bound
-                .get(&at)
-                .cloned()
-                .filter(|_| !bound.contains_key(link))
+        for (target, link) in links {
+            let at = if target.starts_with('/') { target.clone() } else { normalize(&format!("{}/{target}", link.rsplit_once('/').map_or("", |d| d.0))) };
+            if !bound.contains_key(link)
+                && let Some(b) = bound.get(&at).cloned()
             {
                 bound.insert(link.clone(), b);
                 changed = true;
@@ -416,7 +360,14 @@ fn apply(edits: &[&Value], relocate: bool) -> Result<Edits, String> {
             break;
         }
     }
+}
+
+/// The guest's mount lines for `bound` (container path → host path, read-only),
+/// and whether libraries went to [`LIB_DIR`]: with `relocate`, each library
+/// under its own name, once.
+fn mount_lines(bound: BTreeMap<String, (String, bool)>, relocate: bool) -> (Vec<String>, bool) {
     let mut libs = BTreeSet::new();
+    let mut lines = Vec::new();
     for (ctr, (host, ro)) in bound {
         let name = ctr.rsplit('/').next().unwrap_or("");
         let target = if relocate && is_lib(&ctr) {
@@ -427,25 +378,34 @@ fn apply(edits: &[&Value], relocate: bool) -> Result<Edits, String> {
         } else {
             ctr
         };
-        out.mounts
-            .push(format!("{host}\t{target}\t{}", if ro { "ro" } else { "" }));
+        lines.push(format!("{host}\t{target}\t{}", if ro { "ro" } else { "" }));
     }
-    if !libs.is_empty() {
+    (lines, !libs.is_empty())
+}
+
+fn apply(edits: &[&Value], relocate: bool) -> Result<Edits, String> {
+    let c = collect(edits)?;
+    // A mount whose host file is not there is left out: the specs list optional files.
+    let mut bound: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    for (host, ctr, ro) in c.mounts {
+        if Path::new(&host).exists() {
+            bound.entry(ctr).or_insert((host, ro));
+        }
+    }
+    bind_links(&mut bound, &c.links);
+    let (mounts, libs) = mount_lines(bound, relocate);
+    let mut env = c.env;
+    if libs {
         env.push(format!("LD_LIBRARY_PATH={LIB_DIR}"));
     }
-    out.opts.extend(nodes.into_values());
-    out.opts
-        .extend(groups.into_iter().map(|g| format!("group\t{g}")));
-    out.env = env;
-    Ok(out)
+    let opts = c.nodes.into_values().chain(c.groups.into_iter().map(|g| format!("group\t{g}"))).collect();
+    Ok(Edits { opts, mounts, env })
 }
 
 /// A shared library of the driver (not an X server module): bound together under [`LIB_DIR`].
 fn is_lib(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or("");
-    name.starts_with("lib")
-        && (name.ends_with(".so") || name.contains(".so."))
-        && !path.contains("/xorg/")
+    name.starts_with("lib") && (name.ends_with(".so") || name.contains(".so.")) && !path.contains("/xorg/")
 }
 
 /// `a/b/../c` as `a/c`.
