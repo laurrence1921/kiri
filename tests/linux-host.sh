@@ -201,6 +201,16 @@ t build-host-gateway "GW-OK" "gw=\$(docker network inspect bridge --format '{{(i
 # host's /dev/pts and no user on the machine could open a terminal.
 t privileged-host-ptmx "character special file" "mkdir -p /hostdev && mount -t devtmpfs none /hostdev && { [ -c /hostdev/ptmx ] || { rm -f /hostdev/ptmx && mknod -m 666 /hostdev/ptmx c 5 2 && chgrp 5 /hostdev/ptmx; }; } && docker run --rm --privileged alpine true && stat -c %F /hostdev/ptmx; umount /hostdev"
 t privileged-devices "DEVS-OK" "docker run --rm --privileged alpine sh -c 'test -c /dev/kmsg && test -c /dev/null && test -L /dev/ptmx && test -c /dev/pts/ptmx && echo DEVS-OK'"
+# GPUs come from the host's CDI spec (--gpus, --device vendor/class=name). A
+# spec of our own (tests/cdi-fake.json) stands in for NVIDIA's: a device node,
+# a library that needs the soname link its create-symlinks hook would make,
+# and an env var.
+$D cp "$(dirname "$0")/cdi-fake.json" "$N":/cdi-fake.json >/dev/null
+t cdi-gpu "GPU-OK" "mkdir -p /etc/cdi /opt/cdi && echo lib > /opt/cdi/libfake.so.1.2 && cp /cdi-fake.json /etc/cdi/fake.json && docker run --rm --gpus all alpine sh -c 'test -c /dev/fakegpu0 && test \"\$FAKE_GPU\" = 1 && test -f /usr/local/nvidia/lib64/libfake.so.1 && echo \$LD_LIBRARY_PATH | grep -q /usr/local/nvidia/lib64 && echo GPU-OK'"
+t cdi-gpu-name "GPU-OK" "docker run --rm --device nvidia.com/gpu=0 alpine sh -c 'test -c /dev/fakegpu0 && echo GPU-OK'"
+t cdi-gpu-exec "/usr/local/nvidia/lib64" "docker run -d --name lh-gpu --gpus all alpine sleep 60 >/dev/null; docker exec lh-gpu sh -c 'echo \$LD_LIBRARY_PATH'; docker rm -f lh-gpu >/dev/null"
+t cdi-gpu-missing "no CDI spec for nvidia.com/gpu" "rm -f /etc/cdi/fake.json; docker run --rm --gpus all alpine true"
+t cdi-gpu-driver "could not select device driver \"amd\"" "docker run --rm --gpus driver=amd,capabilities=gpu alpine true"
 t privileged-tty "/dev/pts/0" "docker run --rm -t --privileged alpine tty"
 t cleanup "web" "docker rm -f web db dns"
 # Kiri's Stop is the engine's stop, not the user's, as stopping Docker's

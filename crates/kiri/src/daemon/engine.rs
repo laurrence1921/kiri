@@ -644,7 +644,15 @@ impl Spec {
     /// The guest's `opts` lines for a start or an exec. `net_host`: it runs
     /// in the VM's (or host's) network namespace.
     pub fn guest_opts(&self, net_host: bool) -> Result<Vec<String>, Error> {
-        super::hostopts::guest_lines(&self.host_opts, net_host).map_err(Error::BadRequest)
+        let mut lines = super::hostopts::guest_lines(&self.host_opts, net_host).map_err(Error::BadRequest)?;
+        lines.extend(self.cdi_edits()?.opts);
+        Ok(lines)
+    }
+
+    /// What the container's GPUs (`--gpus`, `--device vendor/class=name`) add
+    /// to it, from the host's CDI specs as they are now; see [`super::cdi`].
+    pub fn cdi_edits(&self) -> Result<super::cdi::Edits, Error> {
+        super::cdi::edits(&self.host_opts).map_err(Error::BadRequest)
     }
 
     /// Whether `--sysctl net.ipv6.conf.{all,default,<ifname>}.disable_ipv6=1`
@@ -3663,6 +3671,17 @@ impl Engine {
         // Joining a host-network container is the host's namespace too: its
         // net.* sysctls would change the whole VM (or Linux host).
         let joined_host = joined_mode.is_some_and(|m| self.lock_networks().find(&m).is_some_and(|n| n.driver == "host"));
+        let cdi = match spec.cdi_edits() {
+            Ok(c) => c,
+            Err(e) => {
+                self.fail_start(&id, &spec, &e);
+                return Err(e);
+            }
+        };
+        let mut gpu_env = spec.env.clone();
+        cdi.apply_env(&mut gpu_env);
+        let mut gpu_mounts = spec.mounts.clone();
+        gpu_mounts.extend(cdi.mounts.iter().cloned());
         let host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
@@ -3706,7 +3725,7 @@ impl Engine {
         let started = if cancelled() {
             Err(io::Error::other("cancelled before it reached the guest"))
         } else {
-            vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
+            vm.run(&id, &layers, &argv, &gpu_env, &spec.cwd, &spec.user, &hostname, flags, net_args, &gpu_mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
         };
         if let Ok(pid) = started
             && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)
@@ -5402,6 +5421,10 @@ impl Engine {
             let opts = st.containers.get(&container_id).map(|c| c.spec.guest_opts(false).unwrap_or_default()).unwrap_or_default();
             exec_security = (security, caps, opts);
             let mut env = st.containers.get(&container_id).map(|c| c.spec.env.clone()).unwrap_or_default();
+            // The driver's library path, for `exec nvidia-smi` on a --gpus container.
+            if let Some(Ok(g)) = st.containers.get(&container_id).map(|c| c.spec.cdi_edits()) {
+                g.apply_env(&mut env);
+            }
             for e in &config.env {
                 let key = e.split('=').next().unwrap_or_default();
                 env.retain(|x| x.split('=').next() != Some(key));

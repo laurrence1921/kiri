@@ -8,6 +8,7 @@ mod api;
 pub(crate) mod binds;
 mod builder;
 mod caller;
+mod cdi;
 mod daemon_json;
 pub mod dns;
 pub mod tls;

@@ -7,7 +7,7 @@
 use serde_json::{Value, json};
 
 /// The HostConfig keys kept with a container.
-const KEYS: [&str; 7] = ["Ulimits", "Sysctls", "Devices", "DeviceCgroupRules", "GroupAdd", "MaskedPaths", "ReadonlyPaths"];
+const KEYS: [&str; 8] = ["Ulimits", "Sysctls", "Devices", "DeviceRequests", "DeviceCgroupRules", "GroupAdd", "MaskedPaths", "ReadonlyPaths"];
 
 /// Docker's default `MaskedPaths` and `ReadonlyPaths`, as inspect shows them.
 const MASKED: [&str; 12] = [
@@ -102,16 +102,12 @@ pub fn system_paths(opts: &Value, key: &str, privileged: bool) -> Value {
     }
 }
 
-/// `--gpus` and Compose `deploy.resources.reservations.devices` arrive as
-/// DeviceRequests. Kiri has no GPU to give, and saying so beats a container
-/// that silently runs on the CPU.
+/// `--gpus`, Compose `deploy.resources.reservations.devices` and `--device
+/// <vendor>/<class>=<name>`: devices a CDI spec on a Linux host describes,
+/// see [`super::cdi`]. Refused with Docker's error when there is no spec for
+/// them, or on a host where Kiri cannot give them.
 pub fn check_device_requests(host: &Value) -> Result<(), String> {
-    let Some(r) = host["DeviceRequests"].as_array().and_then(|a| a.first()) else { return Ok(()) };
-    let caps = r["Capabilities"].as_array().map(|c| c.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
-    Err(format!(
-        "could not select device driver {:?} with capabilities: [{caps}]: Kiri does not support GPUs or other device requests",
-        r["Driver"].as_str().unwrap_or("")
-    ))
+    super::cdi::edits(&from_host(host)).map(|_| ())
 }
 
 /// The guest's lines for `opts` (from [`from_host`]), or Docker's error for
@@ -150,6 +146,10 @@ pub fn guest_lines(opts: &Value, net_host: bool) -> Result<Vec<String>, String> 
     }
     for d in opts["Devices"].as_array().into_iter().flatten() {
         let host = d["PathOnHost"].as_str().unwrap_or("");
+        // `--device nvidia.com/gpu=0`: a CDI device, see [`super::cdi`].
+        if super::cdi::is_qualified(host) {
+            continue;
+        }
         let container = d["PathInContainer"].as_str().filter(|p| !p.is_empty()).unwrap_or(host);
         let perms = d["CgroupPermissions"].as_str().filter(|p| !p.is_empty()).unwrap_or("rwm");
         for p in [host, container] {
@@ -355,11 +355,14 @@ mod tests {
     }
 
     #[test]
-    fn device_requests_are_refused() {
+    fn device_requests_need_a_cdi_spec() {
         assert!(check_device_requests(&json!({})).is_ok());
         assert!(check_device_requests(&json!({"DeviceRequests": []})).is_ok());
-        let e = check_device_requests(&json!({"DeviceRequests": [{"Driver": "", "Count": -1, "Capabilities": [["gpu"]]}]})).unwrap_err();
-        assert!(e.starts_with("could not select device driver \"\" with capabilities: [[\"gpu\"]]"), "{e}");
+        // A CDI name is not a path, and is not one of the guest's device lines.
+        let host = json!({"Devices": [{"PathOnHost": "nvidia.com/gpu=0", "PathInContainer": "", "CgroupPermissions": ""}]});
+        assert!(guest_lines(&from_host(&host), false).unwrap().iter().all(|l| !l.starts_with("device\t")));
+        let e = check_device_requests(&json!({"DeviceRequests": [{"Driver": "amd", "Count": -1, "Capabilities": [["gpu"]]}]})).unwrap_err();
+        assert!(e.starts_with("could not select device driver \"amd\" with capabilities: [[gpu]]"), "{e}");
     }
 
     #[test]

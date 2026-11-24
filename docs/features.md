@@ -145,6 +145,15 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   (`packaging/linux`): `kiri` with the docker CLI, Compose and buildx, or
   `kiri-lite` for the engine alone. Membership of the `kiri` group is
   root-equivalent, exactly like the `docker` group
+- **GPUs on Linux hosts**: `docker run --gpus all`, `--gpus device=0`,
+  `--device nvidia.com/gpu=0` and Compose's `deploy.resources.reservations.devices`
+  use the host's CDI spec (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`,
+  read at every start, so a driver update is picked up). Its device nodes, driver
+  libraries (bound under `/usr/local/nvidia/lib64`, on `LD_LIBRARY_PATH`), tools
+  such as `nvidia-smi`, env and groups are added to the container. CDI hooks are
+  not run; `create-symlinks` is done by binding each library under its soname.
+  Other drivers, and macOS and Windows hosts, still get Docker's "could not
+  select device driver" error
 - **Windows**: the x86-64 Linux build in a WSL2 distro, and `kiri-win.exe`,
   which serves the API on `npipe:////./pipe/kiri` (the `kiri` docker
   context) and carries it into WSL over one `wsl.exe … kiri bridge`, so it
