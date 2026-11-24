@@ -210,7 +210,8 @@ t cdi-gpu "GPU-OK" "mkdir -p /etc/cdi /opt/cdi && echo lib > /opt/cdi/libfake.so
 t cdi-gpu-name "GPU-OK" "docker run --rm --device nvidia.com/gpu=0 alpine sh -c 'test -c /dev/fakegpu0 && echo GPU-OK'"
 t cdi-gpu-exec "/usr/local/nvidia/lib64" "docker run -d --name lh-gpu --gpus all alpine sleep 60 >/dev/null; docker exec lh-gpu sh -c 'echo \$LD_LIBRARY_PATH'; docker rm -f lh-gpu >/dev/null"
 t cdi-gpu-missing "no CDI spec for nvidia.com/gpu" "rm -f /etc/cdi/fake.json; docker run --rm --gpus all alpine true"
-t cdi-gpu-driver "could not select device driver \"amd\"" "docker run --rm --gpus driver=amd,capabilities=gpu alpine true"
+t cdi-gpu-driver "could not select device driver \"foo\"" "docker run --rm --gpus driver=foo,capabilities=gpu alpine true"
+t cdi-gpu-amd-missing "amd-ctk cdi generate" "docker run --rm --gpus driver=amd,capabilities=gpu alpine true"
 t privileged-tty "/dev/pts/0" "docker run --rm -t --privileged alpine tty"
 t cleanup "web" "docker rm -f web db dns"
 # Kiri's Stop is the engine's stop, not the user's, as stopping Docker's

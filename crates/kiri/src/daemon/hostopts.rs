@@ -365,8 +365,8 @@ mod tests {
         // A CDI name is not a path, and is not one of the guest's device lines.
         let host = json!({"Devices": [{"PathOnHost": "nvidia.com/gpu=0", "PathInContainer": "", "CgroupPermissions": ""}]});
         assert!(guest_lines(&from_host(&host), false).unwrap().iter().all(|l| !l.starts_with("device\t")));
-        let e = check_device_requests(&json!({"DeviceRequests": [{"Driver": "amd", "Count": -1, "Capabilities": [["gpu"]]}]})).unwrap_err();
-        assert!(e.starts_with("could not select device driver \"amd\" with capabilities: [[gpu]]"), "{e}");
+        let e = check_device_requests(&json!({"DeviceRequests": [{"Driver": "foo", "Count": -1, "Capabilities": [["gpu"]]}]})).unwrap_err();
+        assert!(e.starts_with("could not select device driver \"foo\" with capabilities: [[gpu]]"), "{e}");
     }
 
     #[test]

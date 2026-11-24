@@ -152,8 +152,10 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   libraries (bound under `/usr/local/nvidia/lib64`, on `LD_LIBRARY_PATH`), tools
   such as `nvidia-smi`, env and groups are added to the container. CDI hooks are
   not run; `create-symlinks` is done by binding each library under its soname.
-  Other drivers, and macOS and Windows hosts, still get Docker's "could not
-  select device driver" error
+  AMD (`--gpus driver=amd`, `--device amd.com/gpu=all`) and Intel use their own
+  CDI specs the same way, and `--device /dev/dri` works without one. Other
+  drivers, and macOS and Windows hosts, still get Docker's "could not select
+  device driver" error
 - **Windows**: the x86-64 Linux build in a WSL2 distro, and `kiri-win.exe`,
   which serves the API on `npipe:////./pipe/kiri` (the `kiri` docker
   context) and carries it into WSL over one `wsl.exe … kiri bridge`, so it

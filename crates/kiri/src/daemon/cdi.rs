@@ -110,20 +110,21 @@ fn requested(opts: &Value) -> Result<Vec<(String, Pick)>, String> {
             .filter_map(|c| c.as_str())
             .collect();
         match driver {
-            "" | "nvidia" if caps.contains(&"gpu") || caps.contains(&"nvidia") => {
+            d if vendor_kind(d).is_some() && (caps.contains(&"gpu") || caps.contains(&"nvidia")) => {
+                let kind = vendor_kind(d).unwrap_or_default();
                 let count = r["Count"].as_i64().unwrap_or(0);
                 if !ids.is_empty() {
                     for id in ids {
                         out.push(if is_qualified(id) {
                             split(id)
                         } else {
-                            ("nvidia.com/gpu".to_owned(), Pick::Name(id.to_owned()))
+                            (kind.to_owned(), Pick::Name(id.to_owned()))
                         });
                     }
                 } else if count < 0 {
-                    out.push(("nvidia.com/gpu".to_owned(), Pick::All));
+                    out.push((kind.to_owned(), Pick::All));
                 } else if count > 0 {
-                    out.push(("nvidia.com/gpu".to_owned(), Pick::First(count as usize)));
+                    out.push((kind.to_owned(), Pick::First(count as usize)));
                 }
             }
             "cdi" => {
@@ -139,7 +140,7 @@ fn requested(opts: &Value) -> Result<Vec<(String, Pick)>, String> {
             }
             _ => {
                 return Err(format!(
-                    "could not select device driver {driver:?} with capabilities: [{}]: Kiri supports GPUs through NVIDIA's CDI spec (driver \"nvidia\" or \"\" with capability \"gpu\", or driver \"cdi\")",
+                    "could not select device driver {driver:?} with capabilities: [{}]: Kiri supports GPUs through CDI specs (driver \"nvidia\" or \"\", \"amd\" or \"intel\", with capability \"gpu\", or driver \"cdi\")",
                     caps.iter()
                         .map(|c| format!("[{c}]"))
                         .collect::<Vec<_>>()
@@ -166,6 +167,27 @@ fn split(qualified: &str) -> (String, Pick) {
             Pick::Name(name.to_owned())
         },
     )
+}
+
+/// The CDI kind `--gpus driver=<name>` means. NVIDIA is the default driver
+/// (what `--gpus all` sends); `amd` and `intel` name the other two vendors.
+fn vendor_kind(driver: &str) -> Option<&'static str> {
+    match driver {
+        "" | "nvidia" => Some("nvidia.com/gpu"),
+        "amd" => Some("amd.com/gpu"),
+        "intel" => Some("intel.com/gpu"),
+        _ => None,
+    }
+}
+
+/// What to do when the host has no spec for `kind`.
+fn missing_hint(kind: &str) -> &'static str {
+    match kind {
+        "nvidia.com/gpu" => "for NVIDIA, install nvidia-container-toolkit and run: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+        "amd.com/gpu" => "for AMD, install the AMD container toolkit and run: sudo amd-ctk cdi generate --output=/etc/cdi/amd.json; or pass --device /dev/kfd --device /dev/dri",
+        "intel.com/gpu" => "for Intel, pass --device /dev/dri, or add a CDI spec for intel.com/gpu to /etc/cdi",
+        _ => "add a CDI spec for it to /etc/cdi",
+    }
 }
 
 /// Whether `opts` (a container's kept HostConfig) asks for CDI devices.
@@ -205,11 +227,12 @@ fn edits_in(opts: &Value, dirs: &[PathBuf]) -> Result<Edits, String> {
             .collect();
         if found.is_empty() {
             return Err(format!(
-                "could not select device driver \"\" with capabilities: [[gpu]]: no CDI spec for {kind} in {} (for NVIDIA, install nvidia-container-toolkit and run: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml)",
+                "could not select device driver \"\" with capabilities: [[gpu]]: no CDI spec for {kind} in {} ({})",
                 dirs.iter()
                     .map(|d| d.display().to_string())
                     .collect::<Vec<_>>()
-                    .join(" or ")
+                    .join(" or "),
+                missing_hint(kind)
             ));
         }
         let devices = |i: usize| specs[i]["devices"].as_array().into_iter().flatten();
@@ -265,10 +288,12 @@ fn edits_in(opts: &Value, dirs: &[PathBuf]) -> Result<Edits, String> {
         }
     }
     all_edits.extend(picked.iter().map(|(_, d)| &d["containerEdits"]));
-    apply(&all_edits)
+    // NVIDIA's libraries are bound together under one directory; another vendor's stay where its spec puts them.
+    let relocate = requests.iter().any(|(k, _)| k.starts_with("nvidia.com/"));
+    apply(&all_edits, relocate)
 }
 
-fn apply(edits: &[&Value]) -> Result<Edits, String> {
+fn apply(edits: &[&Value], relocate: bool) -> Result<Edits, String> {
     let mut out = Edits::default();
     let mut nodes: BTreeMap<String, String> = BTreeMap::new(); // container path → line
     let mut mounts: Vec<(String, String, bool)> = Vec::new();
@@ -394,7 +419,7 @@ fn apply(edits: &[&Value]) -> Result<Edits, String> {
     let mut libs = BTreeSet::new();
     for (ctr, (host, ro)) in bound {
         let name = ctr.rsplit('/').next().unwrap_or("");
-        let target = if is_lib(&ctr) {
+        let target = if relocate && is_lib(&ctr) {
             if !libs.insert(name.to_owned()) {
                 continue;
             }
@@ -807,14 +832,43 @@ containerEdits:
         let e = edits_in(&json!({"DeviceRequests": [{"Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]]}]}), &[PathBuf::from("/nonexistent/cdi")]).unwrap_err();
         assert!(e.contains("no CDI spec for nvidia.com/gpu"), "{e}");
         let e = edits_in(
-            &json!({"DeviceRequests": [{"Driver": "amd", "Count": -1, "Capabilities": [["gpu"]]}]}),
+            &json!({"DeviceRequests": [{"Driver": "foo", "Count": -1, "Capabilities": [["gpu"]]}]}),
             std::slice::from_ref(&d),
         )
         .unwrap_err();
         assert!(
-            e.starts_with("could not select device driver \"amd\""),
+            e.starts_with("could not select device driver \"foo\""),
             "{e}"
         );
+        // No AMD spec on this host: the message says how to make one, and that --device /dev/dri works.
+        let e = edits_in(&json!({"DeviceRequests": [{"Driver": "amd", "Count": -1, "Capabilities": [["gpu"]]}]}), std::slice::from_ref(&d)).unwrap_err();
+        assert!(e.contains("no CDI spec for amd.com/gpu") && e.contains("amd-ctk cdi generate") && e.contains("--device /dev/dri"), "{e}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn amd_and_intel_from_their_specs() {
+        let d = std::env::temp_dir().join(format!("kiri-cdi-amd-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("libamd.so.1"), "x").unwrap();
+        for (kind, driver, node) in [("amd.com/gpu", "amd", "/dev/kfd"), ("intel.com/gpu", "intel", "/dev/dri/renderD128")] {
+            let spec = json!({"cdiVersion": "0.5.0", "kind": kind,
+                "devices": [{"name": "0", "containerEdits": {"deviceNodes": [{"path": node, "hostPath": "/dev/null"}], "additionalGids": [44]}}],
+                "containerEdits": {"mounts": [{"hostPath": d.join("libamd.so.1").to_str().unwrap(), "containerPath": "/opt/vendor/libamd.so.1", "options": ["ro"]}]}});
+            let dir = d.join(driver);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("gpu.json"), spec.to_string()).unwrap();
+            // `--gpus driver=<vendor> count=all`, and the CDI name, both give the vendor's nodes; its library stays where its spec puts it.
+            for opts in [
+                json!({"DeviceRequests": [{"Driver": driver, "Count": -1, "Capabilities": [["gpu"]]}]}),
+                json!({"Devices": [{"PathOnHost": format!("{kind}=0")}]}),
+            ] {
+                let e = edits_in(&opts, std::slice::from_ref(&dir)).unwrap();
+                assert_eq!(e.opts, [format!("device\t/dev/null\t{node}\trwm"), "group\t44".to_owned()], "{opts}");
+                assert_eq!(e.mounts, [format!("{}\t/opt/vendor/libamd.so.1\tro", d.join("libamd.so.1").display())]);
+                assert!(e.env.is_empty(), "no NVIDIA library path for {kind}");
+            }
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
 
