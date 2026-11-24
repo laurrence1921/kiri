@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #645 Localization: Ukrainian's Share is a button, and other wording fixes (unreleased)
+- Fixes: no issue
+- Caused: none known
+- Caused by: -
+- Check: none
+
 ### #745, #134 HTTP: drain bounded chunked trailers, handle `Expect: 100-continue`, and reject conflicting request framing (unreleased)
 - Fixes: #745 Chunked HTTP/1.1 request bodies with trailers corrupt subsequent requests on keep-alive connections; #134 Handle `Expect: 100-continue` before reading request bodies and reject ambiguous `Transfer-Encoding` + `Content-Length` framing per RFC 9112
 - Caused: none known
