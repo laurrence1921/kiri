@@ -107,6 +107,10 @@ pub fn system_paths(opts: &Value, key: &str, privileged: bool) -> Value {
 /// see [`super::cdi`]. Refused with Docker's error when there is no spec for
 /// them, or on a host where Kiri cannot give them.
 pub fn check_device_requests(host: &Value) -> Result<(), String> {
+    // Nothing asked for: nothing read.
+    if !super::cdi::wanted(host) {
+        return Ok(());
+    }
     super::cdi::edits(&from_host(host)).map(|_| ())
 }
 

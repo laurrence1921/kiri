@@ -3678,10 +3678,17 @@ impl Engine {
                 return Err(e);
             }
         };
-        let mut gpu_env = spec.env.clone();
-        cdi.apply_env(&mut gpu_env);
-        let mut gpu_mounts = spec.mounts.clone();
-        gpu_mounts.extend(cdi.mounts.iter().cloned());
+        // No GPU asked for: the env and mounts are the spec's own, not copies.
+        let (gpu_env, gpu_mounts);
+        let (start_env, start_mounts) = if cdi.env.is_empty() && cdi.mounts.is_empty() {
+            (&spec.env, &spec.mounts)
+        } else {
+            let mut env = spec.env.clone();
+            cdi.apply_env(&mut env);
+            gpu_env = env;
+            gpu_mounts = spec.mounts.iter().chain(&cdi.mounts).cloned().collect::<Vec<_>>();
+            (&gpu_env, &gpu_mounts)
+        };
         let host_opts = match spec.guest_opts(flags & run_flags::NET_HOST != 0 || joined_host) {
             Ok(o) => o,
             Err(e) => {
@@ -3725,7 +3732,7 @@ impl Engine {
         let started = if cancelled() {
             Err(io::Error::other("cancelled before it reached the guest"))
         } else {
-            vm.run(&id, &layers, &argv, &gpu_env, &spec.cwd, &spec.user, &hostname, flags, net_args, &gpu_mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
+            vm.run(&id, &layers, &argv, start_env, &spec.cwd, &spec.user, &hostname, flags, net_args, start_mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
         };
         if let Ok(pid) = started
             && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)

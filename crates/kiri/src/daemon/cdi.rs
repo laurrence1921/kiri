@@ -438,8 +438,14 @@ fn normalize(path: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
+// How many times specs were read, for the test that a container asking for no GPU reads none.
+#[cfg(test)]
+thread_local!(static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
 /// Every spec in `dirs` that reads: `.json`, `.yaml` and `.yml` files, by name.
 fn load(dirs: &[PathBuf]) -> Vec<Value> {
+    #[cfg(test)]
+    LOADS.with(|n| n.set(n.get() + 1));
     let mut files: Vec<PathBuf> = dirs
         .iter()
         .filter_map(|d| std::fs::read_dir(d).ok())
@@ -810,6 +816,19 @@ containerEdits:
             "{e}"
         );
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn no_gpu_asked_for_reads_nothing() {
+        let before = LOADS.with(|n| n.get());
+        for opts in [json!({}), json!({"DeviceRequests": []}), json!({"Devices": [{"PathOnHost": "/dev/fuse"}]}), Value::Null] {
+            assert_eq!(edits(&opts).unwrap(), Edits::default());
+        }
+        assert!(crate::daemon::hostopts::check_device_requests(&json!({"Devices": [{"PathOnHost": "/dev/fuse"}]})).is_ok());
+        let mut env = vec!["A=1".to_owned()];
+        Edits::default().apply_env(&mut env);
+        assert_eq!(env, ["A=1"]);
+        assert_eq!(LOADS.with(|n| n.get()), before);
     }
 
     #[test]
